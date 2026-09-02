@@ -1,0 +1,164 @@
+name: 02 - Catalog to Gold
+
+# CSSC Catalog stage.
+#
+# Releases an image from quarantine into the gold standard registry. Promotion is a
+# server-side `az acr import` referencing the source by digest, so the bits are provably
+# identical on both sides and nothing is rebuilt.
+
+on:
+  workflow_run:
+    workflows: ["01 - Acquire to DMZ"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-gold
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote to gold registry
+    runs-on: ubuntu-24.04
+    # workflow_run fires on failure too; only promote what actually passed acquisition.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      gold_digest: ${{ steps.promote.outputs.digest }}
+      gold_reference: ${{ steps.promote.outputs.reference }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Load configuration
+        uses: ./.github/actions/load-config
+        with:
+          dmz-registry-name: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          gold-registry-name: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+
+      - name: Azure login
+        uses: ./.github/actions/azure-login
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          registry: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+
+      - name: Install ORAS
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" -o /tmp/oras.tar.gz
+          tar -xzf /tmp/oras.tar.gz -C /tmp oras
+          sudo install -m 0755 /tmp/oras /usr/local/bin/oras
+
+      - name: Resolve quarantined digest
+        id: source
+        env:
+          DMZ_REGISTRY: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          DMZ_ENDPOINT: ${{ vars.ACR_DMZ_REGISTRY_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          digest="$(az acr manifest show-metadata \
+            --registry "$DMZ_REGISTRY" \
+            --name "${DMZ_REPOSITORY}:${SOURCE_TAG}" \
+            --query digest -o tsv)"
+
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "reference=${DMZ_ENDPOINT}/${DMZ_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Quarantined image is at ${digest}"
+
+      - name: Verify quarantine release criteria
+        env:
+          SOURCE_REF: ${{ steps.source.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # An image only leaves quarantine if the Acquire stage attached a scan report.
+          # Without this check, promotion would be a blind copy.
+          artifact_type="application/vnd.copacetic-demo.trivy.report.v1+json"
+
+          if ! oras discover --format json --artifact-type "$artifact_type" \
+              "$SOURCE_REF" > referrers.json 2>discover.err; then
+            echo "::error::Failed to query referrers for ${SOURCE_REF}"
+            cat discover.err
+            exit 1
+          fi
+
+          # oras has used both "manifests" and "referrers" as the top-level key across
+          # releases; accept either.
+          found="$(jq '[(.manifests // .referrers // [])[]] | length' referrers.json)"
+
+          if [[ "$found" -eq 0 ]]; then
+            echo "::error::No Trivy scan attestation found on ${SOURCE_REF}."
+            echo "::error::The image has not cleared the Acquire stage. Run workflow 01 first."
+            exit 1
+          fi
+
+          echo "Found ${found} scan attestation(s); image is cleared to leave quarantine."
+
+      - name: Promote to gold registry
+        id: promote
+        env:
+          DMZ_REGISTRY_ID: ${{ vars.ACR_DMZ_REGISTRY_ID }}
+          GOLD_REGISTRY: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+          GOLD_ENDPOINT: ${{ vars.ACR_GOLD_REGISTRY_ENDPOINT }}
+          SOURCE_DIGEST_REF: ${{ steps.source.outputs.digest }}
+        run: |
+          set -euo pipefail
+          target="${GOLD_REPOSITORY}:${IMAGE_VERSION}"
+
+          # --registry takes the source registry resource id, so the copy happens
+          # registry-to-registry using this workflow's own identity. No pull, no push.
+          az acr import \
+            --name "$GOLD_REGISTRY" \
+            --registry "$DMZ_REGISTRY_ID" \
+            --source "${DMZ_REPOSITORY}@${SOURCE_DIGEST_REF}" \
+            --image "$target" \
+            --force
+
+          digest="$(az acr manifest show-metadata \
+            --registry "$GOLD_REGISTRY" \
+            --name "$target" \
+            --query digest -o tsv)"
+
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "reference=${GOLD_ENDPOINT}/${GOLD_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify promotion preserved the digest
+        env:
+          DMZ_DIGEST: ${{ steps.source.outputs.digest }}
+          GOLD_DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$DMZ_DIGEST" != "$GOLD_DIGEST" ]]; then
+            echo "::error::Promotion altered the image."
+            echo "::error::dmz=${DMZ_DIGEST} gold=${GOLD_DIGEST}"
+            exit 1
+          fi
+          echo "Digest identical across registries: ${GOLD_DIGEST}"
+
+      - name: Write job summary
+        env:
+          DMZ_REF: ${{ steps.source.outputs.reference }}
+          GOLD_REF: ${{ steps.promote.outputs.reference }}
+          GOLD_ENDPOINT: ${{ vars.ACR_GOLD_REGISTRY_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## CSSC Catalog - promoted to gold standard registry"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| From (quarantine) | \`${DMZ_REF}\` |"
+            echo "| To (golden) | \`${GOLD_REF}\` |"
+            echo "| Golden tag | \`${GOLD_ENDPOINT}/${GOLD_REPOSITORY}:${IMAGE_VERSION}\` |"
+            echo
+            echo "Digests match, so this was a promotion and not a rebuild."
+            echo "Workflow 03 now patches the golden image with Copacetic."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: copacetic-demo
+metadata:
+  template: copacetic-demo@1.0.0
+
+infra:
+  layers:
+    - name: base
+      provider: terraform
+      path: ./infra/01_base
+      hooks:
+        postprovision:
+          run: ./hooks/bootstrap-github-oidc.sh
+    - name: container_registries
+      provider: terraform
+      path: ./infra/02_container_registries
+      hooks:
+        postprovision:
+          run: ./hooks/publish-registry-vars.sh

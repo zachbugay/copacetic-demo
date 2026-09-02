@@ -1,0 +1,59 @@
+name: Setup patch tools
+description: >-
+  Installs the toolchain required to scan and patch container images: Docker Buildx
+  (Copacetic requires a BuildKit endpoint), Copacetic, Trivy and ORAS.
+
+inputs:
+  copa-version:
+    description: Copacetic version, without the leading "v".
+    required: true
+  trivy-version:
+    description: Trivy version, without the leading "v".
+    required: true
+  oras-version:
+    description: ORAS version, without the leading "v".
+    required: true
+  arch:
+    description: Target architecture for the tool binaries (amd64 or arm64).
+    required: false
+    default: amd64
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Install Copacetic
+      shell: bash
+      env:
+        COPA_VERSION: ${{ inputs.copa-version }}
+        ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        url="https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_${ARCH}.tar.gz"
+        echo "Downloading ${url}"
+        curl -fsSL "$url" -o /tmp/copa.tar.gz
+        tar -xzf /tmp/copa.tar.gz -C /tmp copa
+        sudo install -m 0755 /tmp/copa /usr/local/bin/copa
+        copa --version
+
+    - name: Install Trivy
+      uses: aquasecurity/setup-trivy@v0.3.1
+      with:
+        version: v${{ inputs.trivy-version }}
+        cache: true
+
+    - name: Install ORAS
+      shell: bash
+      env:
+        ORAS_VERSION: ${{ inputs.oras-version }}
+        ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        url="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz"
+        echo "Downloading ${url}"
+        curl -fsSL "$url" -o /tmp/oras.tar.gz
+        tar -xzf /tmp/oras.tar.gz -C /tmp oras
+        sudo install -m 0755 /tmp/oras /usr/local/bin/oras
+        oras version

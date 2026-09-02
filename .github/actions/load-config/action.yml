@@ -1,0 +1,50 @@
+name: Load demo configuration
+description: >-
+  Loads .github/config/images.env into the job environment and validates that the registry
+  repository variables produced by `azd provision` are present.
+
+inputs:
+  dmz-registry-name:
+    description: Value of the ACR_DMZ_REGISTRY_NAME repository variable
+    required: true
+  gold-registry-name:
+    description: Value of the ACR_GOLD_REGISTRY_NAME repository variable
+    required: true
+  client-id:
+    description: Value of the AZURE_CLIENT_ID repository variable
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Load image configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+        config=".github/config/images.env"
+        if [[ ! -f "$config" ]]; then
+          echo "::error::${config} not found. Did the workflow check out the repository?"
+          exit 1
+        fi
+        # Skip comments and blanks; everything else is KEY=value.
+        grep -Ev '^\s*(#|$)' "$config" >> "$GITHUB_ENV"
+        echo "Loaded configuration from ${config}"
+
+    - name: Validate registry variables
+      shell: bash
+      env:
+        DMZ_REGISTRY: ${{ inputs.dmz-registry-name }}
+        GOLD_REGISTRY: ${{ inputs.gold-registry-name }}
+        CLIENT_ID: ${{ inputs.client-id }}
+      run: |
+        set -euo pipefail
+        missing=()
+        [[ -n "$DMZ_REGISTRY"  ]] || missing+=("ACR_DMZ_REGISTRY_NAME")
+        [[ -n "$GOLD_REGISTRY" ]] || missing+=("ACR_GOLD_REGISTRY_NAME")
+        [[ -n "$CLIENT_ID"     ]] || missing+=("AZURE_CLIENT_ID")
+
+        if (( ${#missing[@]} > 0 )); then
+          echo "::error::Missing repository variables: ${missing[*]}"
+          echo "::error::Run scripts/bootstrap-github-oidc.sh and scripts/publish-registry-vars.sh first."
+          exit 1
+        fi

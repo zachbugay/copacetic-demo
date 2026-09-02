@@ -1,0 +1,371 @@
+name: 03 - Patch Gold with Copacetic
+
+# CSSC Catalog stage, continuous patching.
+#
+# Scans the golden image, patches OS-level CVEs with Copacetic, verifies the result, and
+# repushes to the gold standard registry. Patching fans out across architectures because
+# Copacetic operates on one platform at a time; a final job recombines the per-arch results
+# into a single multi-arch manifest list.
+
+on:
+  workflow_run:
+    workflows: ["02 - Catalog to Gold"]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    # The Catalog stage calls for recurring rescan and patch, not a one-off.
+    - cron: "41 7 * * *"
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: patch-gold
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    name: Patch ${{ matrix.platform }}
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One architecture failing its CVE gate must not hide the other's results.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Load configuration
+        uses: ./.github/actions/load-config
+        with:
+          dmz-registry-name: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          gold-registry-name: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+
+      - name: Setup patch tools
+        uses: ./.github/actions/setup-patch-tools
+        with:
+          copa-version: ${{ env.COPA_VERSION }}
+          trivy-version: ${{ env.TRIVY_VERSION }}
+          oras-version: ${{ env.ORAS_VERSION }}
+          arch: ${{ matrix.arch }}
+
+      - name: Azure login
+        uses: ./.github/actions/azure-login
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          registry: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+
+      - name: Resolve platform manifest
+        id: resolve
+        env:
+          GOLD_ENDPOINT: ${{ vars.ACR_GOLD_REGISTRY_ENDPOINT }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          list_ref="${GOLD_ENDPOINT}/${GOLD_REPOSITORY}:${IMAGE_VERSION}"
+
+          os="${PLATFORM%%/*}"
+          arch="${PLATFORM##*/}"
+
+          # The golden image is a manifest list. Pick the child manifest for this leg so
+          # the vulnerability report describes exactly the platform we are about to patch.
+          child_digest="$(docker buildx imagetools inspect --raw "$list_ref" \
+            | jq -r --arg os "$os" --arg arch "$arch" '
+                if .manifests then
+                  (.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest)
+                else
+                  empty
+                end')"
+
+          if [[ -z "$child_digest" ]]; then
+            echo "::error::${list_ref} has no ${PLATFORM} manifest."
+            exit 1
+          fi
+
+          echo "Resolved ${PLATFORM} to ${child_digest}"
+          {
+            echo "list_ref=${list_ref}"
+            echo "child_digest=${child_digest}"
+            echo "child_ref=${GOLD_ENDPOINT}/${GOLD_REPOSITORY}@${child_digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pre-patch scan
+        env:
+          CHILD_REF: ${{ steps.resolve.outputs.child_ref }}
+        run: |
+          set -euo pipefail
+          # Copacetic consumes this JSON report directly and only acts on fixable OS
+          # packages, so scope the scan the same way.
+          trivy image \
+            --scanners vuln \
+            --pkg-types os \
+            --ignore-unfixed \
+            --format json \
+            --output "pre-${{ matrix.arch }}.json" \
+            "$CHILD_REF"
+
+          trivy convert \
+            --format sarif \
+            --output "pre-${{ matrix.arch }}.sarif" \
+            "pre-${{ matrix.arch }}.json"
+
+      - name: Upload pre-patch SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pre-${{ matrix.arch }}.sarif
+          # Category must include the arch or each upload supersedes the last and the
+          # before/after comparison disappears from the Security tab.
+          category: trivy-gold-pre-${{ matrix.arch }}
+
+      - name: Patch with Copacetic
+        id: copa
+        env:
+          LIST_REF: ${{ steps.resolve.outputs.list_ref }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          patched_tag="${IMAGE_VERSION}-patched"
+
+          # Copa is given the manifest list plus --platform so it resolves and patches the
+          # single target platform itself. This mirrors demo.sh, which passes
+          # --platform linux/arm64 for local WSL/ARM use.
+          copa patch \
+            -i "$LIST_REF" \
+            -r "pre-${ARCH}.json" \
+            -t "$patched_tag" \
+            --platform "$PLATFORM"
+
+          # Copa appends the architecture to the tag when --platform is used, but this has
+          # varied across releases. Detect whichever local tag was actually produced.
+          base="${LIST_REF%:*}"
+          candidates=("${base}:${patched_tag}-${ARCH}" "${base}:${patched_tag}")
+
+          local_ref=""
+          for candidate in "${candidates[@]}"; do
+            if docker image inspect "$candidate" >/dev/null 2>&1; then
+              local_ref="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$local_ref" ]]; then
+            echo "::error::Could not find the patched image. Copa produced:"
+            docker images --format '{{.Repository}}:{{.Tag}}'
+            exit 1
+          fi
+
+          echo "local_ref=${local_ref}" >> "$GITHUB_OUTPUT"
+          echo "Patched image is ${local_ref}"
+
+      - name: Inspect patch layer
+        env:
+          LOCAL_REF: ${{ steps.copa.outputs.local_ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo "<details><summary>Layer history for <code>${{ matrix.platform }}</code></summary>"
+            echo
+            echo '```'
+            docker history "$LOCAL_REF" \
+              --format "table {{.ID}}\t{{.CreatedSince}}\t{{.Size}}\t{{.Comment}}"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-patch scan
+        env:
+          LOCAL_REF: ${{ steps.copa.outputs.local_ref }}
+        run: |
+          set -euo pipefail
+          trivy image \
+            --scanners vuln \
+            --pkg-types os \
+            --ignore-unfixed \
+            --format json \
+            --output "post-${{ matrix.arch }}.json" \
+            "$LOCAL_REF"
+
+          trivy convert \
+            --format sarif \
+            --output "post-${{ matrix.arch }}.sarif" \
+            "post-${{ matrix.arch }}.json"
+
+      - name: Upload post-patch SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: post-${{ matrix.arch }}.sarif
+          category: trivy-gold-patched-${{ matrix.arch }}
+
+      - name: Report remediation delta
+        run: |
+          set -euo pipefail
+          {
+            echo "### Copacetic remediation - \`${{ matrix.platform }}\`"
+            echo
+            ./scripts/cve-summary.sh "post-${{ matrix.arch }}.json" "pre-${{ matrix.arch }}.json"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate on remaining vulnerabilities
+        run: |
+          set -euo pipefail
+          remaining="$(jq '[.Results[]?.Vulnerabilities[]?
+            | select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' \
+            "post-${{ matrix.arch }}.json")"
+
+          if (( remaining > 0 )); then
+            echo "::error::${remaining} fixable HIGH/CRITICAL OS vulnerabilities remain after patching ${{ matrix.platform }}."
+            jq -r '[.Results[]?.Vulnerabilities[]?
+              | select(.Severity == "HIGH" or .Severity == "CRITICAL")]
+              | .[] | "  \(.Severity)\t\(.VulnerabilityID)\t\(.PkgName)"' \
+              "post-${{ matrix.arch }}.json" | sort -u
+            exit 1
+          fi
+
+          echo "No fixable HIGH/CRITICAL OS vulnerabilities remain."
+
+      - name: Push patched image
+        id: push
+        env:
+          LOCAL_REF: ${{ steps.copa.outputs.local_ref }}
+          GOLD_ENDPOINT: ${{ vars.ACR_GOLD_REGISTRY_ENDPOINT }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          arch_tag="${GOLD_ENDPOINT}/${GOLD_REPOSITORY}:${IMAGE_VERSION}-patched-${ARCH}"
+          run_tag="${arch_tag}-${GITHUB_RUN_NUMBER}"
+
+          docker tag "$LOCAL_REF" "$arch_tag"
+          docker tag "$LOCAL_REF" "$run_tag"
+          docker push "$arch_tag"
+          docker push "$run_tag"
+
+          digest="$(docker buildx imagetools inspect "$arch_tag" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+
+          echo "arch_tag=${arch_tag}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${arch_tag} at ${digest}"
+
+          oras attach \
+            --artifact-type application/vnd.copacetic-demo.trivy.report.v1+json \
+            --annotation "cssc.stage=catalog-patched" \
+            --annotation "cssc.scanner=trivy" \
+            --annotation "cssc.patched-by=copacetic" \
+            --annotation "cssc.platform=${{ matrix.platform }}" \
+            "$arch_tag" \
+            "post-${ARCH}.json:application/json"
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: patch
+    # Never publish a manifest list that is missing a platform or contains an unpatched
+    # one. A partial matrix failure leaves the per-arch tags for inspection instead.
+    if: needs.patch.result == 'success'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Load configuration
+        uses: ./.github/actions/load-config
+        with:
+          dmz-registry-name: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          gold-registry-name: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+
+      - name: Azure login
+        uses: ./.github/actions/azure-login
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          registry: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list
+        id: manifest
+        env:
+          GOLD_ENDPOINT: ${{ vars.ACR_GOLD_REGISTRY_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          repo="${GOLD_ENDPOINT}/${GOLD_REPOSITORY}"
+          patched="${repo}:${IMAGE_VERSION}-patched"
+          run_tag="${repo}:${IMAGE_VERSION}-patched-${GITHUB_RUN_NUMBER}"
+
+          docker buildx imagetools create \
+            --tag "$patched" \
+            --tag "$run_tag" \
+            "${repo}:${IMAGE_VERSION}-patched-amd64" \
+            "${repo}:${IMAGE_VERSION}-patched-arm64"
+
+          digest="$(docker buildx imagetools inspect "$patched" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+
+          echo "Published ${patched} at ${digest}"
+          {
+            echo "patched=${patched}"
+            echo "run_tag=${run_tag}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify both platforms are present
+        env:
+          PATCHED: ${{ steps.manifest.outputs.patched }}
+        run: |
+          set -euo pipefail
+          platforms="$(docker buildx imagetools inspect --raw "$PATCHED" \
+            | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture)"' | sort -u)"
+
+          echo "Manifest list contains:"
+          echo "$platforms"
+
+          for expected in linux/amd64 linux/arm64; do
+            if ! grep -qx "$expected" <<<"$platforms"; then
+              echo "::error::${PATCHED} is missing ${expected}"
+              exit 1
+            fi
+          done
+
+      - name: Write job summary
+        env:
+          PATCHED: ${{ steps.manifest.outputs.patched }}
+          RUN_TAG: ${{ steps.manifest.outputs.run_tag }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Patched golden image published"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Multi-arch tag | \`${PATCHED}\` |"
+            echo "| Immutable tag | \`${RUN_TAG}\` |"
+            echo "| Manifest digest | \`${DIGEST}\` |"
+            echo "| Platforms | \`linux/amd64\`, \`linux/arm64\` |"
+            echo
+            echo '```bash'
+            echo "docker pull ${PATCHED}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

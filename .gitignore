@@ -1,0 +1,18 @@
+.azure
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Scan artifacts produced by the workflows and by demo.sh
+*.sarif
+pre-*.json
+post-*.json

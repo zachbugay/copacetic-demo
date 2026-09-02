@@ -1,0 +1,37 @@
+name: Azure login (OIDC)
+description: >-
+  Authenticates to Azure using GitHub OIDC federated credentials and optionally logs the
+  Docker client into a container registry. No secrets are used; the caller must grant
+  `id-token: write`.
+
+inputs:
+  client-id:
+    description: Client id of the federated managed identity or app registration.
+    required: true
+  tenant-id:
+    description: Entra tenant id.
+    required: true
+  subscription-id:
+    description: Target Azure subscription id.
+    required: true
+  registry:
+    description: >-
+      Optional ACR short name to run `az acr login` against. Leave empty to authenticate to
+      Azure control plane only (sufficient for `az acr import`).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Azure login
+      uses: azure/login@v3
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+
+    - name: Registry login
+      if: inputs.registry != ''
+      shell: bash
+      run: az acr login --name "${{ inputs.registry }}"

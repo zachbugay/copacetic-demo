@@ -1,0 +1,198 @@
+name: 01 - Acquire to DMZ
+
+# CSSC Acquire stage.
+#
+# Pulls a digest-pinned image from a public registry into the DMZ / quarantine registry,
+# scans it, and attaches the vulnerability report as an OCI artifact. The image is treated
+# as untrusted here: this workflow deliberately never fails on CVE count, because the
+# demo depends on the base image being vulnerable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Source repository, e.g. library/nginx
+        required: false
+        type: string
+      source_digest:
+        description: Source manifest digest, e.g. sha256:...
+        required: false
+        type: string
+  schedule:
+    # Weekly re-acquire so the demo shows CVE drift accumulating in the base image.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  actions: read
+
+concurrency:
+  group: acquire-dmz
+  cancel-in-progress: false
+
+jobs:
+  acquire:
+    name: Import and quarantine
+    runs-on: ubuntu-24.04
+    outputs:
+      dmz_digest: ${{ steps.import.outputs.digest }}
+      dmz_reference: ${{ steps.import.outputs.reference }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Load configuration
+        uses: ./.github/actions/load-config
+        with:
+          dmz-registry-name: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          gold-registry-name: ${{ vars.ACR_GOLD_REGISTRY_NAME }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+
+      - name: Apply dispatch overrides
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          OVERRIDE_REPOSITORY: ${{ inputs.source_repository }}
+          OVERRIDE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$OVERRIDE_REPOSITORY" ]]; then
+            echo "SOURCE_REPOSITORY=${OVERRIDE_REPOSITORY}" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "$OVERRIDE_DIGEST" ]]; then
+            if [[ ! "$OVERRIDE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::source_digest must be a full sha256 digest"
+              exit 1
+            fi
+            echo "SOURCE_DIGEST=${OVERRIDE_DIGEST}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Azure login
+        uses: ./.github/actions/azure-login
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          registry: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+
+      - name: Import image into DMZ registry
+        id: import
+        env:
+          DMZ_REGISTRY: ${{ vars.ACR_DMZ_REGISTRY_NAME }}
+          DMZ_ENDPOINT: ${{ vars.ACR_DMZ_REGISTRY_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          source_ref="${SOURCE_REGISTRY}/${SOURCE_REPOSITORY}@${SOURCE_DIGEST}"
+          target="${DMZ_REPOSITORY}:${SOURCE_TAG}"
+
+          echo "Importing ${source_ref}"
+          echo "       to ${DMZ_ENDPOINT}/${target}"
+
+          # Server-side copy: the runner never pulls the image, and the full multi-arch
+          # manifest list is preserved intact.
+          az acr import \
+            --name "$DMZ_REGISTRY" \
+            --source "$source_ref" \
+            --image "$target" \
+            --force
+
+          digest="$(az acr manifest show-metadata \
+            --registry "$DMZ_REGISTRY" \
+            --name "$target" \
+            --query digest -o tsv)"
+
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "reference=${DMZ_ENDPOINT}/${DMZ_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "Imported digest ${digest}"
+
+      - name: Verify digest survived the import
+        env:
+          IMPORTED_DIGEST: ${{ steps.import.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$IMPORTED_DIGEST" != "$SOURCE_DIGEST" ]]; then
+            echo "::error::Digest changed during import."
+            echo "::error::expected ${SOURCE_DIGEST}, got ${IMPORTED_DIGEST}"
+            exit 1
+          fi
+          echo "Digest matches the pinned source: ${IMPORTED_DIGEST}"
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: Install ORAS
+        run: |
+          set -euo pipefail
+          url="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/oras.tar.gz
+          tar -xzf /tmp/oras.tar.gz -C /tmp oras
+          sudo install -m 0755 /tmp/oras /usr/local/bin/oras
+          oras version
+
+      - name: Scan quarantined image
+        env:
+          IMAGE_REF: ${{ steps.import.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # --ignore-unfixed keeps the report to CVEs that a patch can actually resolve,
+          # which is the same set Copacetic will act on later.
+          trivy image \
+            --scanners vuln \
+            --pkg-types os \
+            --ignore-unfixed \
+            --format json \
+            --output dmz-scan.json \
+            "$IMAGE_REF"
+
+          trivy convert \
+            --format sarif \
+            --output dmz-scan.sarif \
+            dmz-scan.json
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: dmz-scan.sarif
+          category: trivy-dmz
+
+      - name: Attach scan report to image
+        env:
+          IMAGE_REF: ${{ steps.import.outputs.reference }}
+        run: |
+          set -euo pipefail
+          # CSSC Acquire step 6: attach the vulnerability report as an image attestation so
+          # the Catalog stage can verify the image was actually scanned before promotion.
+          oras attach \
+            --artifact-type application/vnd.copacetic-demo.trivy.report.v1+json \
+            --annotation "org.opencontainers.artifact.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --annotation "cssc.stage=acquire" \
+            --annotation "cssc.scanner=trivy" \
+            --annotation "cssc.run-id=${GITHUB_RUN_ID}" \
+            "$IMAGE_REF" \
+            dmz-scan.json:application/json
+
+      - name: Write job summary
+        env:
+          IMAGE_REF: ${{ steps.import.outputs.reference }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## CSSC Acquire - quarantined in DMZ registry"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Source | \`${SOURCE_REGISTRY}/${SOURCE_REPOSITORY}@${SOURCE_DIGEST}\` |"
+            echo "| Quarantined as | \`${IMAGE_REF}\` |"
+            echo
+            echo "### Fixable OS vulnerabilities"
+            echo
+            ./scripts/cve-summary.sh dmz-scan.json
+            echo
+            echo "> This stage never fails on CVE count. The image is expected to be"
+            echo "> vulnerable; Copacetic remediates it in workflow 03."
+          } >> "$GITHUB_STEP_SUMMARY"
